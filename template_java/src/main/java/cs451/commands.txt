@@ -1,0 +1,10 @@
+bash ./build.sh
+
+bash ./run.sh --id 1 --hosts ../example/hosts --output ../example/output/1.output ../example/configs/perfect-links.config
+
+bash ./run.sh --id 2 --hosts ../example/hosts --output ../example/output/2.output ../example/configs/perfect-links.config
+
+bash ./run.sh --id 3 --hosts ../example/hosts --output ../example/output/3.output ../example/configs/perfect-links.config
+
+
+python ../tools/stress.py perfect -r ./run.sh -l ../example/output -p 3 -m 100
