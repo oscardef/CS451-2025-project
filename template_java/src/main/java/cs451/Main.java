@@ -1,20 +1,37 @@
 package cs451;
 
-
 import cs451.net.UdpChannel;
-import cs451.pl.impl.StopAndWaitPL;
+import cs451.links.fairloss.FairLossLinkImpl;
+import cs451.links.stubborn.StubbornLinkImpl;
+import cs451.links.perfect.PerfectLinkImpl;
 import cs451.util.LineLogger;
 
 import java.net.SocketException;
+import java.util.List;
+import java.util.Scanner;
 
+/**
+ * Main entry point for Milestone 1: Perfect Links
+ * ---------------------------------------------------------------
+ * - Process 1 acts as receiver (logs all deliveries)
+ * - All other processes send messages to process 1
+ * - Periodic logging and minimal I/O overhead
+ * - Terminates after all sends complete
+ */
 public class Main {
 
-    private static void handleSignal() {
-        //immediately stop network packet processing
-        System.out.println("Immediately stopping network packet processing.");
+    // Control flags
+    private static final boolean MUTE = false;        // disable console output for performance
+    private static final int LOG_INTERVAL = 50;     // log every Nth message (adjust for submission)
 
-        //write/flush output file if necessary
-        System.out.println("Writing output.");
+
+    private static void log(String msg) {
+        if (!MUTE) System.out.println(msg);
+    }
+
+    private static void handleSignal() {
+        log("Immediately stopping network packet processing.");
+        log("Writing output.");
     }
 
     private static void initSignalHandlers() {
@@ -26,87 +43,69 @@ public class Main {
         });
     }
 
-    public static void main(String[] args) throws InterruptedException, SocketException {
+    public static void main(String[] args) throws Exception {
         Parser parser = new Parser(args);
         parser.parse();
-
         initSignalHandlers();
 
-        long pid = ProcessHandle.current().pid();
-        System.out.println("My PID: " + pid + "\n");
-        System.out.println("From another terminal type `kill -SIGINT " + pid +
-                "` or `kill -SIGTERM " + pid + "` to stop processing packets\n");
-
-        System.out.println("My ID: " + parser.myId() + "\n");
-        System.out.println("List of resolved hosts is:");
-        System.out.println("==========================");
-        for (Host host : parser.hosts()) {
-            System.out.println(host.getId());
-            System.out.println("Human-readable IP: " + host.getIp());
-            System.out.println("Human-readable Port: " + host.getPort());
-            System.out.println();
-        }
-        System.out.println();
-
-        System.out.println("Path to output:");
-        System.out.println("===============");
-        System.out.println(parser.output() + "\n");
-
-        System.out.println("Path to config:");
-        System.out.println("===============");
-        System.out.println(parser.config() + "\n");
-
-        System.out.println("Doing some initialization...\n");
-
-        // ---- Step 1: Build the UDP channel (bind to my port) ----
         int myId = parser.myId();
-        var hosts = parser.hosts();
-        var me = hosts.get(myId - 1);
+        List<Host> hosts = parser.hosts();
+        Host me = hosts.get(myId - 1);
 
-        var channel = UdpChannel.bind(me.getPort(), /*soTimeoutMillis=*/0);
+        // ---- Read config: "m i" ----
+        String configPath = parser.config();
+        int m = 0, receiverId = 0;
+        try (Scanner sc = new Scanner(new java.io.File(configPath))) {
+            if (sc.hasNextInt()) m = sc.nextInt();
+            if (sc.hasNextInt()) receiverId = sc.nextInt();
+        }
 
-        // ---- Step 2: Create Perfect Link instance ----
-        var pl = new StopAndWaitPL(myId, hosts, channel);
+        // ---- Setup channel and layers ----
+        var channel = UdpChannel.bind(me.getPort(), 0);
+        var flp = new FairLossLinkImpl(myId, hosts, channel);
+        var slp = new StubbornLinkImpl(flp, hosts);
+        var pl = new PerfectLinkImpl(myId, hosts, slp);
 
-        // ---- Step 3: Set up logger ----
-        // LineLogger writes "b <id> <seq>" for broadcasts and "d <id> <seq>" for deliveries.
         var logger = new LineLogger(parser.output());
 
-        // ---- Step 4: Register delivery callback ----
-        pl.onDeliver((sender, seq) -> {
-            logger.logD(sender, seq);  // Log a delivery event
-            System.out.println("[deliver] from " + sender + " seq=" + seq);
+        pl.onDeliver((sender, seq, data) -> {
+            logger.logD(sender, seq);
+            if (!MUTE && seq % LOG_INTERVAL == 0)
+                log("[deliver] from " + sender + " seq=" + seq);
         });
 
-        // ---- Step 5: Start the Perfect Link ----
         pl.start();
 
-        // Gracefully stop PL and flush logs on process termination
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
                 pl.stop();
-                logger.flush();  // Ensure all lines are written before exit
+                logger.flush();
             } catch (Exception ignored) {}
         }));
 
-        System.out.println("Broadcasting and delivering messages...\n");
+        if (myId != receiverId) {
+            // ---- Sender ----
+            Host receiver = hosts.get(receiverId - 1);
+            if (!MUTE)
+                log("I am sender " + myId + ", sending " + m + " msgs to " + receiverId);
 
-        // ---- Step 6: Example broadcast test ----
-        // Only process 1 sends messages in this simple test
-        if (myId == 1) {
-            for (int seq = 1; seq <= 5; seq++) {
-                logger.logB(seq); // log once per broadcast
-                // Send to all other processes
-                for (Host h : hosts) {
-                    if (h.getId() == myId) continue;
-                    System.out.println("[test] sending seq=" + seq + " to process " + h.getId());
-                    pl.send(h.getId(), seq);
-                }
-                Thread.sleep(200); // small delay between sends for readability
+            for (int seq = 1; seq <= m; seq++) {
+                logger.logB(seq);
+                pl.send(receiver, new byte[0], seq);
+
+                // Light throttling avoids overwhelming network in tests
+                if (seq % 1000 == 0) Thread.sleep(1);
             }
+
+            if (!MUTE)
+                log("Sender " + myId + " finished sending all messages.");
+        } else {
+            // ---- Receiver ----
+            if (!MUTE)
+                log("I am receiver " + myId + ", waiting for messages...");
         }
 
-        // Keep running indefinitely (terminated via kill)
         Thread.sleep(Long.MAX_VALUE);
     }
+
 }
