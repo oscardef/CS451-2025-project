@@ -29,24 +29,25 @@ public class Main {
         if (!MUTE) System.out.println(msg);
     }
 
-    private static void handleSignal() {
+    private static void handleSignal(LineLogger logger, PerfectLinkImpl pl) {
         log("Immediately stopping network packet processing.");
-        log("Writing output.");
+        try {
+            pl.stop();
+            logger.flush();
+        } catch (Exception e) {
+            System.err.println("Error during shutdown: " + e.getMessage());
+        }
+        log("Writing output completed.");
     }
 
-    private static void initSignalHandlers() {
-        Runtime.getRuntime().addShutdownHook(new Thread() {
-            @Override
-            public void run() {
-                handleSignal();
-            }
-        });
+    private static void initSignalHandlers(LineLogger logger, PerfectLinkImpl pl) {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> handleSignal(logger, pl)));
     }
+
 
     public static void main(String[] args) throws Exception {
         Parser parser = new Parser(args);
         parser.parse();
-        initSignalHandlers();
 
         int myId = parser.myId();
         List<Host> hosts = parser.hosts();
@@ -60,31 +61,30 @@ public class Main {
             if (sc.hasNextInt()) receiverId = sc.nextInt();
         }
 
-        // ---- Setup channel and layers ----
+        // Initialize logger before signal handlers
+        var logger = new LineLogger(parser.output());
+
+        // Setup layers
         var channel = UdpChannel.bind(me.getPort(), 0);
         var flp = new FairLossLinkImpl(myId, hosts, channel);
         var slp = new StubbornLinkImpl(flp, hosts);
         var pl = new PerfectLinkImpl(myId, hosts, slp);
 
-        var logger = new LineLogger(parser.output());
+        // Must install handler *after* PL created
+        initSignalHandlers(logger, pl);
 
+        // On deliver: always log and periodically flush
         pl.onDeliver((sender, seq, data) -> {
             logger.logD(sender, seq);
-            if (!MUTE && seq % LOG_INTERVAL == 0)
-                log("[deliver] from " + sender + " seq=" + seq);
+            if (seq % LOG_INTERVAL == 0) {
+                logger.flush();
+                if (!MUTE) log("[deliver] from " + sender + " seq=" + seq);
+            }
         });
 
         pl.start();
 
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            try {
-                pl.stop();
-                logger.flush();
-            } catch (Exception ignored) {}
-        }));
-
         if (myId != receiverId) {
-            // ---- Sender ----
             Host receiver = hosts.get(receiverId - 1);
             if (!MUTE)
                 log("I am sender " + myId + ", sending " + m + " msgs to " + receiverId);
@@ -93,19 +93,23 @@ public class Main {
                 logger.logB(seq);
                 pl.send(receiver, new byte[0], seq);
 
-                // Light throttling avoids overwhelming network in tests
-                if (seq % 1000 == 0) Thread.sleep(1);
+                // Periodically flush and throttle
+                if (seq % 1000 == 0) {
+                    logger.flush();
+                    Thread.sleep(1);
+                }
             }
 
+            logger.flush();  // flush remaining messages at the end
             if (!MUTE)
                 log("Sender " + myId + " finished sending all messages.");
         } else {
-            // ---- Receiver ----
             if (!MUTE)
                 log("I am receiver " + myId + ", waiting for messages...");
         }
 
         Thread.sleep(Long.MAX_VALUE);
+
     }
 
 }

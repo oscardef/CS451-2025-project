@@ -37,14 +37,16 @@ public class LineLogger {
 
     /** Flush buffered log lines to disk. */
     public synchronized void flush() {
-        try (BufferedWriter writer = new BufferedWriter(new FileWriter(path))) {
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(path, true))) {  // append = true
             for (String line : lines) {
                 writer.write(line);
-                writer.newLine();
+                writer.newLine();  // ensures each line ends correctly
             }
             writer.flush();
+            lines.clear();  // free memory after flushing
         } catch (IOException e) {
             System.err.println("[LineLogger] Failed to flush logs: " + e.getMessage());
         }
     }
+
 }
