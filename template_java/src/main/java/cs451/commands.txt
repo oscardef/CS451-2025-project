@@ -7,4 +7,41 @@ bash ./run.sh --id 2 --hosts ../example/hosts --output ../example/output/2.outpu
 bash ./run.sh --id 3 --hosts ../example/hosts --output ../example/output/3.output ../example/configs/perfect-links.config
 
 
-python ../tools/stress.py perfect -r ./run.sh -l ../example/output -p 3 -m 100
+
+TESTING:
+
+sudo python ../tools/tc.py
+
+python ../tools/stress.py perfect -r ./run.sh -l ../example/output -p 5 -m 200
+
+
+python ../tools/verify_pl_outputs.py \
+  --hosts ../example/output/hosts \
+  --config ../example/output/config \
+  --outdir ../example/output
+
+
+
+python ../tools/run_pl_matrix.py \
+  --runscript ./run.sh \
+  --logsdir ../example/output \
+  --processes 3 5 \
+  --messages 10 100 1000
+
+
+
+profiling:
+
+java -XX:StartFlightRecording=filename=recording.jfr,dumponexit=true -jar bin/da_proc.jar --id ... --hosts ... --output ... CONFIG
+jfr print recording.jfr | less
+
+jstat (GC / memory): jstat -gcutil <PID> 1s
+
+pidstat (CPU, context switches): pidstat -urd 1
+
+perf (system-level CPU hotspots): perf record -g -p <PID>; perf report
+
+tcpdump (batch sanity): tcpdump -i lo -w out.pcap udp port <your_port> then inspect packet sizes in Wireshark
+
+/proc/<pid>/fd/ – ensure only one UDP socket per process is open
+

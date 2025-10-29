@@ -1,3 +1,4 @@
-I am sender 2, sending 50000 msgs to 1
+I am sender 2, sending 200 msgs to 1
+Sender 2 finished sending all messages.
 Immediately stopping network packet processing.
 Writing output completed.

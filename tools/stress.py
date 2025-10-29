@@ -495,7 +495,7 @@ if __name__ == "__main__":
         "attemptsDistribution": {  # Probability with which an interferring thread will
             "STOP": 0.48,  # select an interferring action (make sure they add up to 1)
             "CONT": 0.48,
-            "TERM": 0.04,
+            "TERM": 0.00,  # How many processes can be terminated
         },
     }
 

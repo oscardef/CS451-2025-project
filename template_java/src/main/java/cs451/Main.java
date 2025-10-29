@@ -62,53 +62,53 @@ public class Main {
         }
 
         // Initialize logger before signal handlers
-        var logger = new LineLogger(parser.output());
+    var logger = new LineLogger(parser.output());
 
-        // Setup layers
-        var channel = UdpChannel.bind(me.getPort(), 0);
-        var flp = new FairLossLinkImpl(myId, hosts, channel);
-        var slp = new StubbornLinkImpl(flp, hosts);
-        var pl = new PerfectLinkImpl(myId, hosts, slp);
+    // Setup layers
+    var channel = UdpChannel.bind(me.getPort(), 0);
+    var flp = new FairLossLinkImpl(myId, hosts, channel);
+    var slp = new StubbornLinkImpl(flp, hosts);
+    var pl = new PerfectLinkImpl(myId, hosts, slp);
 
-        // Must install handler *after* PL created
-        initSignalHandlers(logger, pl);
+    // Must install handler *after* PL created
+    initSignalHandlers(logger, pl);
 
-        // On deliver: always log and periodically flush
-        pl.onDeliver((sender, seq, data) -> {
-            logger.logD(sender, seq);
-            if (seq % LOG_INTERVAL == 0) {
+    // On deliver: always log and periodically flush
+    pl.onDeliver((sender, seq, data) -> {
+        logger.logD(sender, seq);
+        if (seq % LOG_INTERVAL == 0) {
+            logger.flush();
+            if (!MUTE) log("[deliver] from " + sender + " seq=" + seq);
+        }
+    });
+
+    pl.start();
+
+    if (myId != receiverId) {
+        Host receiver = hosts.get(receiverId - 1);
+        if (!MUTE)
+            log("I am sender " + myId + ", sending " + m + " msgs to " + receiverId);
+
+        for (int seq = 1; seq <= m; seq++) {
+            logger.logB(seq);
+            pl.send(receiver, new byte[0], seq);
+
+            // Periodically flush and throttle
+            if (seq % 1000 == 0) {
                 logger.flush();
-                if (!MUTE) log("[deliver] from " + sender + " seq=" + seq);
+                Thread.sleep(1);
             }
-        });
-
-        pl.start();
-
-        if (myId != receiverId) {
-            Host receiver = hosts.get(receiverId - 1);
-            if (!MUTE)
-                log("I am sender " + myId + ", sending " + m + " msgs to " + receiverId);
-
-            for (int seq = 1; seq <= m; seq++) {
-                logger.logB(seq);
-                pl.send(receiver, new byte[0], seq);
-
-                // Periodically flush and throttle
-                if (seq % 1000 == 0) {
-                    logger.flush();
-                    Thread.sleep(1);
-                }
-            }
-
-            logger.flush();  // flush remaining messages at the end
-            if (!MUTE)
-                log("Sender " + myId + " finished sending all messages.");
-        } else {
-            if (!MUTE)
-                log("I am receiver " + myId + ", waiting for messages...");
         }
 
-        Thread.sleep(Long.MAX_VALUE);
+        logger.flush();  // flush remaining messages at the end
+        if (!MUTE)
+            log("Sender " + myId + " finished sending all messages.");
+    } else {
+        if (!MUTE)
+            log("I am receiver " + myId + ", waiting for messages...");
+    }
+
+    Thread.sleep(Long.MAX_VALUE);
 
     }
 
