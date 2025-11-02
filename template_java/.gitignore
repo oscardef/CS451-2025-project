@@ -4,6 +4,8 @@
 target/
 bin/da_proc.jar
 
+../../example
+
 ### Java ###
 # Compiled class file
 *.class

@@ -21,8 +21,10 @@ import java.util.Scanner;
 public class Main {
 
     // Control flags
-    private static final boolean MUTE = false;        // disable console output for performance
-    private static final int LOG_INTERVAL = 50;     // log every Nth message (adjust for submission)
+    private static final boolean MUTE = true;        // disable console output for performance
+    private static final int LOG_INTERVAL = 16000;     // log every Nth message (adjust for submission)
+
+    private static final byte[] EMPTY = new byte[0];
 
 
     private static void log(String msg) {
@@ -91,12 +93,11 @@ public class Main {
 
         for (int seq = 1; seq <= m; seq++) {
             logger.logB(seq);
-            pl.send(receiver, new byte[0], seq);
+            pl.send(receiver, EMPTY, seq);
 
             // Periodically flush and throttle
-            if (seq % 1000 == 0) {
+            if (seq % LOG_INTERVAL == 0) {
                 logger.flush();
-                Thread.sleep(1);
             }
         }
 
