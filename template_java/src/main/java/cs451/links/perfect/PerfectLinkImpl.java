@@ -5,18 +5,23 @@ import cs451.links.stubborn.StubbornLink;
 
 import java.nio.ByteBuffer;
 import java.util.*;
-import java.util.concurrent.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * PerfectLinkImpl — Reliable, Exactly-Once delivery with safe message batching.
+ * PerfectLinkImpl — Reliable, exactly-once delivery on top of Stubborn Link.
  *
- * Adds lightweight batching of DATA messages before sending to reduce per-packet overhead.
- * Batches are clearly marked with TYPE_BATCH to avoid decoding ambiguity.
+ * Key points:
+ *  - Uses (senderId, seq) as a 64-bit key for dedup + ACK tracking.
+ *  - Batches DATA messages (no background flush thread):
+ *      * Flushes when batch hits MAX_BATCH
+ *      * Also soft-flushes every SOFT_FLUSH_EVERY sends (counter-based)
+ *  - ACKs are sent as single messages (simple and fast enough).
  */
 public final class PerfectLinkImpl implements PerfectLink {
 
-    // ---- Lower layer ----
+    // ---- Lower layer / membership ----
     private final StubbornLink slp;
     private final List<Host> membership;
     private final int myId;
@@ -24,30 +29,25 @@ public final class PerfectLinkImpl implements PerfectLink {
     // ---- Control ----
     private final AtomicBoolean running = new AtomicBoolean(false);
 
-    // ---- Message bookkeeping ----
-    private final Set<Long> delivered = ConcurrentHashMap.newKeySet();       // Deduplication
-    private final Set<Long> awaitingAck = ConcurrentHashMap.newKeySet();     // Awaiting ACKs
-    private final Map<Long, byte[]> sentMessages = new ConcurrentHashMap<>();// Sent message cache
+    // ---- Bookkeeping ----
+    private final Set<Long> delivered        = ConcurrentHashMap.newKeySet();
+    private final Set<Long> awaitingAck      = ConcurrentHashMap.newKeySet();
+    private final Map<Long, byte[]> sentMsgs = new ConcurrentHashMap<>();
 
     // ---- Delivery callback ----
     private volatile DeliverHandler deliverHandler = (sender, seq, data) -> {};
 
-    // ---- Constants for message types ----
+    // ---- Wire protocol ----
     private static final byte TYPE_DATA  = 1;
     private static final byte TYPE_ACK   = 2;
     private static final byte TYPE_BATCH = 3;
 
-    // ---- Batching ----
-    private static final int MAX_BATCH = 8;         // Messages per datagram
-    private static final int FLUSH_INTERVAL_MS = 2; // Flush interval
+    // ---- Batching (no background thread) ----
+    private static final int MAX_BATCH = 8;        // messages per datagram
+    private static final int SOFT_FLUSH_MASK = (1 << 13) - 1; // 8192-1 (power-of-two mask)
 
-    private final Map<Integer, List<byte[]>> batchBuffers = new ConcurrentHashMap<>();
-    private final ScheduledExecutorService batchFlusher =
-            Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "batch-flusher");
-                t.setDaemon(true);
-                return t;
-            });
+    private final Map<Integer, ArrayDeque<byte[]>> batches = new ConcurrentHashMap<>();
+    private final AtomicInteger sendCounter = new AtomicInteger(0);
 
     public PerfectLinkImpl(int myId, List<Host> membership, StubbornLink slp) {
         this.myId = myId;
@@ -60,35 +60,36 @@ public final class PerfectLinkImpl implements PerfectLink {
         if (!running.compareAndSet(false, true)) return;
         slp.start();
         slp.onDeliver(this::handleReceive);
-
-        // Periodic flush of partial batches
-        batchFlusher.scheduleAtFixedRate(this::flushAllBatches,
-                FLUSH_INTERVAL_MS, FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
     @Override
     public void stop() {
         if (!running.compareAndSet(true, false)) return;
-        batchFlusher.shutdownNow();
+        // Flush any residual batches so no messages are stuck
+        flushAllBatches();
         slp.stop();
     }
 
     @Override
     public void send(Host dest, byte[] data, int seq) {
-        byte[] msg = encodeMessage(TYPE_DATA, myId, seq, data);
+        // Build DATA message bytes once
+        byte[] msg = encode(TYPE_DATA, myId, seq, data);
         long k = key(dest.getId(), seq);
-
         awaitingAck.add(k);
-        sentMessages.put(k, msg);
+        sentMsgs.put(k, msg);
 
-        List<byte[]> batch = batchBuffers.computeIfAbsent(dest.getId(),
-                id -> Collections.synchronizedList(new ArrayList<>(MAX_BATCH)));
-
-        synchronized (batch) {
-            batch.add(msg);
-            if (batch.size() >= MAX_BATCH) {
-                flushBatch(dest, batch);
+        // Put into the dest's batch (create deque if missing)
+        ArrayDeque<byte[]> q = batches.computeIfAbsent(dest.getId(), id -> new ArrayDeque<>(MAX_BATCH));
+        synchronized (q) {
+            q.addLast(msg);
+            if (q.size() >= MAX_BATCH) {
+                flushBatch(dest, q);
             }
+        }
+
+        // Soft flush every ~8k sends to avoid long tails without extra threads
+        if ((sendCounter.incrementAndGet() & SOFT_FLUSH_MASK) == 0) {
+            flushAllBatches();
         }
     }
 
@@ -97,85 +98,88 @@ public final class PerfectLinkImpl implements PerfectLink {
         this.deliverHandler = handler;
     }
 
-    /** Flush all destination buffers periodically. */
+    /** Flush all partial batches (called on stop, and periodically via counter). */
     private void flushAllBatches() {
-        for (Map.Entry<Integer, List<byte[]>> e : batchBuffers.entrySet()) {
+        for (Map.Entry<Integer, ArrayDeque<byte[]>> e : batches.entrySet()) {
             Host dest = membership.get(e.getKey() - 1);
-            List<byte[]> batch = e.getValue();
-            synchronized (batch) {
-                if (!batch.isEmpty()) flushBatch(dest, batch);
+            ArrayDeque<byte[]> q = e.getValue();
+            synchronized (q) {
+                if (!q.isEmpty()) flushBatch(dest, q);
             }
         }
     }
 
-    /** Encodes and sends a batch of messages via the stubborn link. */
-    private void flushBatch(Host dest, List<byte[]> batch) {
-        synchronized (batch) {
-            if (batch.isEmpty()) return;
+    /** Build and send one TYPE_BATCH datagram for the queued messages. */
+    private void flushBatch(Host dest, ArrayDeque<byte[]> q) {
+        if (q.isEmpty()) return;
 
-            int total = 1 + 4; // type + count
-            for (byte[] m : batch) total += 4 + m.length;
-            ByteBuffer bb = ByteBuffer.allocate(total);
+        int count = q.size();
+        int total = 1 + 4; // type + count
+        for (byte[] m : q) total += 4 + m.length;
 
-            bb.put(TYPE_BATCH);
-            bb.putInt(batch.size());
-            for (byte[] m : batch) {
-                bb.putInt(m.length);
-                bb.put(m);
-            }
-
-            slp.send(dest, bb.array());
-            batch.clear();
+        ByteBuffer bb = ByteBuffer.allocate(total);
+        bb.put(TYPE_BATCH);
+        bb.putInt(count);
+        for (byte[] m : q) {
+            bb.putInt(m.length);
+            bb.put(m);
         }
+
+        slp.send(dest, bb.array());
+        q.clear();
     }
 
-    /** Handles all messages received from the stubborn link layer. */
+    /** Handle bytes coming up from SLP (could be single or batch). */
     private void handleReceive(int senderId, byte[] raw) {
-        if (raw == null || raw.length < 2) return; // safety check
-        ByteBuffer bb = ByteBuffer.wrap(raw);
-        byte type = bb.get();
+        if (raw == null || raw.length == 0) return;
 
-        if (type == TYPE_BATCH) {
-            if (bb.remaining() < 4) return; // malformed
+        byte first = raw[0];
+        if (first == TYPE_BATCH) {
+            // [TYPE_BATCH(1) | count(4) | (len(4) | msg[len])+ ]
+            if (raw.length < 5) return;
+            ByteBuffer bb = ByteBuffer.wrap(raw);
+            bb.get(); // type
             int count = bb.getInt();
-            for (int i = 0; i < count && bb.remaining() >= 4; i++) {
+            for (int i = 0; i < count; i++) {
+                if (bb.remaining() < 4) break;
                 int len = bb.getInt();
-                if (len <= 0 || len > bb.remaining()) break; // avoid underflow
+                if (len < 1 || len > bb.remaining()) break;
                 byte[] msg = new byte[len];
                 bb.get(msg);
-                handleSingleMessage(senderId, msg);
+                handleSingle(senderId, msg);
             }
         } else {
-            handleSingleMessage(senderId, raw);
+            handleSingle(senderId, raw);
         }
     }
 
-    /** Handles one logical DATA or ACK message. */
-    private void handleSingleMessage(int senderId, byte[] raw) {
-        if (raw == null || raw.length < 9) return; // too short for header
+    /** Decode one logical message (DATA/ACK). */
+    private void handleSingle(int senderId, byte[] raw) {
+        if (raw.length < 9) return; // type(1) + sender(4) + seq(4)
         ByteBuffer bb = ByteBuffer.wrap(raw);
+
         byte type = bb.get();
         int sender = bb.getInt();
         int seq = bb.getInt();
 
         byte[] payload = new byte[Math.max(0, bb.remaining())];
-        bb.get(payload);
+        if (payload.length > 0) bb.get(payload);
 
         if (type == TYPE_DATA) {
             long k = key(sender, seq);
             if (delivered.add(k)) {
                 deliverHandler.deliver(sender, seq, payload);
             }
-
-            // Always send ACK
+            // ACK back to sender
             Host senderHost = membership.get(sender - 1);
-            byte[] ack = encodeMessage(TYPE_ACK, myId, seq, new byte[0]);
+            byte[] ack = encode(TYPE_ACK, myId, seq, new byte[0]);
             slp.send(senderHost, ack);
 
         } else if (type == TYPE_ACK) {
+            // ACK sender == our original dest, that matches awaitingAck key
             long k = key(sender, seq);
             awaitingAck.remove(k);
-            byte[] msg = sentMessages.remove(k);
+            byte[] msg = sentMsgs.remove(k);
             if (msg != null) {
                 Host senderHost = membership.get(sender - 1);
                 slp.remove(senderHost, msg);
@@ -183,8 +187,8 @@ public final class PerfectLinkImpl implements PerfectLink {
         }
     }
 
-    /** Encode one message: [type(1B) | sender(4B) | seq(4B) | payload...] */
-    private byte[] encodeMessage(byte type, int senderId, int seq, byte[] data) {
+    /** Encode: [type(1) | sender(4) | seq(4) | payload...] */
+    private static byte[] encode(byte type, int senderId, int seq, byte[] data) {
         ByteBuffer bb = ByteBuffer.allocate(1 + 4 + 4 + data.length);
         bb.put(type);
         bb.putInt(senderId);
@@ -193,8 +197,8 @@ public final class PerfectLinkImpl implements PerfectLink {
         return bb.array();
     }
 
-    /** Unique key for identifying a message by (processId, seqNr). */
+    /** 64-bit key for (id,seq). */
     private static long key(int sender, int seq) {
-        return (((long)sender) << 32) | (seq & 0xffffffffL);
+        return (((long) sender) << 32) | (seq & 0xffffffffL);
     }
 }

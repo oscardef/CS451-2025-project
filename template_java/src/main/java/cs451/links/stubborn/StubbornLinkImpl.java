@@ -8,55 +8,30 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * StubbornLinkImpl — Implements the Stubborn Point-to-Point Links (SLP).
- *
- * ----------------------------------------------------------------------
- * The Stubborn Link adds reliability on top of Fair-Loss Links (FLP)
- * by *repeatedly retransmitting* all sent messages forever.
- *
- * Properties:
- *  - Ensures that if the network eventually stops losing packets,
- *    all messages will eventually be delivered.
- *  - May deliver duplicates (deduplication will be handled by PL).
- *
- * Reference (slides pseudocode):
- *
- * upon p2pSend(m, q):
- *     while true:
- *         trigger <flp2pSend, m, q>
- *         wait Δ
- *
- * upon <flp2pDeliver, q, m>:
- *     trigger <p2pDeliver, q, m>
- * ----------------------------------------------------------------------
+ * StubbornLinkImpl — keeps re-sending all messages periodically (classic SLP).
+ * PL will call remove() once it gets an ACK.
  */
 public class StubbornLinkImpl implements StubbornLink {
 
-    // ---- Layering ----
-    private final FairLossLink flp;             // Lower layer
-    private final List<Host> membership;        // All known hosts
+    private final FairLossLink flp;
+    private final List<Host> membership;
 
-    // ---- Control ----
     private final AtomicBoolean running = new AtomicBoolean(false);
-    private Thread resendThread;                // Retransmission loop thread
+    private Thread resendThread;
 
-    // ---- Delivery callback ----
     private volatile DeliverHandler deliverHandler = (src, data) -> {};
 
-    // ---- Outgoing message queue ----
-    // Stores messages that should be continuously retransmitted.
+    /** Messages to keep re-sending forever until removed. */
     private final Queue<SendEntry> pending = new ConcurrentLinkedQueue<>();
 
-    // ---- Resend interval (ms) ----
-    private static final int RESEND_INTERVAL_MS = 100; // Adjust if needed
+    /** Resend cadence (higher = fewer resends = less CPU, but slower recovery). */
+    private static final int RESEND_INTERVAL_MS = 100;
 
-    // ---- Helper structure for messages ----
     private static final class SendEntry {
         final Host dest;
         final byte[] data;
         SendEntry(Host dest, byte[] data) {
-            this.dest = dest;
-            this.data = data;
+            this.dest = dest; this.data = data;
         }
     }
 
@@ -69,13 +44,9 @@ public class StubbornLinkImpl implements StubbornLink {
     public void start() {
         if (!running.compareAndSet(false, true)) return;
 
-        // Start underlying FLP
         flp.start();
-
-        // Register to receive messages from FLP and deliver them upward
         flp.onDeliver((senderId, data) -> deliverHandler.deliver(senderId, data));
 
-        // Start retransmission thread
         resendThread = new Thread(this::resendLoop, "slp-resend");
         resendThread.setDaemon(true);
         resendThread.start();
@@ -85,18 +56,13 @@ public class StubbornLinkImpl implements StubbornLink {
     public void stop() {
         if (!running.compareAndSet(true, false)) return;
         flp.stop();
-        try {
-            if (resendThread != null) resendThread.join();
-        } catch (InterruptedException ignored) {}
+        try { if (resendThread != null) resendThread.join(); } catch (InterruptedException ignored) {}
     }
 
     @Override
     public void send(Host dest, byte[] data) {
-        // Add message to the retransmission queue
-        pending.add(new SendEntry(dest, data));
-
-        // Immediately send once
-        flp.send(dest, data);
+        pending.add(new SendEntry(dest, data)); // remember for periodic resend
+        flp.send(dest, data);                   // send once now
     }
 
     @Override
@@ -104,9 +70,7 @@ public class StubbornLinkImpl implements StubbornLink {
         this.deliverHandler = handler;
     }
 
-    /**
-     * Periodically re-sends all messages in the pending queue.
-     */
+    /** Periodically re-send everything that hasn't been ACKed away. */
     private void resendLoop() {
         while (running.get()) {
             try {
@@ -114,17 +78,12 @@ public class StubbornLinkImpl implements StubbornLink {
                     flp.send(e.dest, e.data);
                 }
                 Thread.sleep(RESEND_INTERVAL_MS);
-            } catch (InterruptedException ignored) {
-            }
+            } catch (InterruptedException ignored) {}
         }
     }
 
-    /**
-     * Removes a message from the retransmission queue.
-     * Called by upper layers (e.g., PerfectLink) once a message has been acknowledged.
-     */
+    /** Called by PL when an ACK is received for (dest,msg). */
     public void remove(Host dest, byte[] data) {
         pending.removeIf(e -> e.dest.equals(dest) && Arrays.equals(e.data, data));
     }
-
 }

@@ -11,7 +11,9 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Optimized FairLossLinkImpl — non-blocking UDP, preallocated buffers, no per-packet lookup.
+ * FairLossLinkImpl — best-effort UDP with a dedicated RX thread and a minimal TX queue.
+ * - Pre-resolved address tables (id -> (addr,port)) for fast send.
+ * - Single copy on RX (Arrays.copyOf).
  */
 public final class FairLossLinkImpl implements FairLossLink {
 
@@ -19,8 +21,8 @@ public final class FairLossLinkImpl implements FairLossLink {
     private final List<Host> membership;
     private final UdpChannel channel;
 
-    private final InetAddress[] idToAddr;
-    private final int[] idToPort;
+    private final InetAddress[] idToAddr;   // index by process id (1..N)
+    private final int[] idToPort;           // index by process id (1..N)
     private final Map<String, Integer> addrPortToId = new HashMap<>();
 
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -28,7 +30,7 @@ public final class FairLossLinkImpl implements FairLossLink {
 
     private volatile DeliverHandler deliverHandler = (src, data) -> {};
 
-    /** Lock-free queue for outgoing packets */
+    /** Outgoing packet queue (bounded to avoid unbounded memory). */
     private final BlockingQueue<Packet> sendQ = new LinkedBlockingQueue<>(65536);
 
     private static final class Packet {
@@ -62,12 +64,10 @@ public final class FairLossLinkImpl implements FairLossLink {
     public void start() {
         if (!running.compareAndSet(false, true)) return;
 
-        // Start receiver
         rxThread = new Thread(this::rxLoop, "flp-rx");
         rxThread.setDaemon(true);
         rxThread.start();
 
-        // Start sender
         txThread = new Thread(this::txLoop, "flp-tx");
         txThread.setDaemon(true);
         txThread.start();
@@ -83,11 +83,15 @@ public final class FairLossLinkImpl implements FairLossLink {
 
     @Override
     public void send(Host dest, byte[] data) {
-        // Just enqueue; the dedicated sender thread calls socket.send()
         InetAddress addr = idToAddr[dest.getId()];
         int port = idToPort[dest.getId()];
-        if (addr != null)
-            sendQ.offer(new Packet(addr, port, data));
+        if (addr != null) {
+            // If queue is full, drop old (fair-loss model allows loss)
+            if (!sendQ.offer(new Packet(addr, port, data))) {
+                sendQ.poll(); // drop one
+                sendQ.offer(new Packet(addr, port, data));
+            }
+        }
     }
 
     @Override
@@ -95,18 +99,19 @@ public final class FairLossLinkImpl implements FairLossLink {
         this.deliverHandler = handler;
     }
 
-    /** Dedicated sender thread — drains queue as fast as possible */
+    /** Dedicated sender thread — drain queue quickly. */
     private void txLoop() {
         while (running.get()) {
             try {
                 Packet p = sendQ.poll(1, TimeUnit.MILLISECONDS);
-                if (p != null)
+                if (p != null) {
                     channel.send(p.data, p.data.length, p.addr, p.port);
+                }
             } catch (IOException | InterruptedException ignored) {}
         }
     }
 
-    /** Receiver thread — no per-packet allocation */
+    /** Receiver thread — single allocation per packet. */
     private void rxLoop() {
         final byte[] buf = new byte[65535];
         final UdpChannel.SenderRef src = new UdpChannel.SenderRef();
@@ -118,7 +123,6 @@ public final class FairLossLinkImpl implements FairLossLink {
 
                 Integer senderId = addrPortToId.get(src.address.getHostAddress() + ":" + src.port);
                 if (senderId != null) {
-                    // copy exact payload once
                     byte[] msg = Arrays.copyOf(buf, n);
                     deliverHandler.deliver(senderId, msg);
                 }
