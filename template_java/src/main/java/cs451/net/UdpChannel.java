@@ -34,6 +34,8 @@ public final class UdpChannel implements AutoCloseable {
         DatagramSocket s = new DatagramSocket(null); // unbound
         s.setReuseAddress(true);
         s.setSoTimeout(soTimeoutMillis);             // 0 for blocking receive
+        s.setReceiveBufferSize(8 * 1024 * 1024);  // 8 MB receive buffer
+        s.setSendBufferSize(8 * 1024 * 1024);     // 8 MB send buffer
         s.bind(new InetSocketAddress(localPort));
         return new UdpChannel(s);
     }

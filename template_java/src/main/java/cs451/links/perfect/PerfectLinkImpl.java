@@ -45,9 +45,10 @@ public final class PerfectLinkImpl implements PerfectLink {
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     // ---- Message bookkeeping ----
-    private final Set<String> delivered = ConcurrentHashMap.newKeySet();       // Deduplication
-    private final Set<String> awaitingAck = ConcurrentHashMap.newKeySet();     // Messages still expecting ACK
-    private final Map<String, byte[]> sentMessages = new ConcurrentHashMap<>(); // Store actual bytes for removal later
+    private final Set<Long> delivered = ConcurrentHashMap.newKeySet();       // Deduplication
+    private final Set<Long> awaitingAck = ConcurrentHashMap.newKeySet();     // Awaiting ACKs
+    private final Map<Long, byte[]> sentMessages = new ConcurrentHashMap<>();// Sent message cache
+
 
     // ---- Delivery callback ----
     private volatile DeliverHandler deliverHandler = (sender, seq, data) -> {};
@@ -89,7 +90,7 @@ public final class PerfectLinkImpl implements PerfectLink {
         byte[] msg = encodeMessage(TYPE_DATA, myId, seq, data);
 
         // Track this message until ACKed
-        String k = key(dest.getId(), seq);
+        long k = key(dest.getId(), seq);
         awaitingAck.add(k);
         sentMessages.put(k, msg);
 
@@ -119,7 +120,7 @@ public final class PerfectLinkImpl implements PerfectLink {
         bb.get(payload);
 
         if (type == TYPE_DATA) {
-            String k = key(sender, seq);
+            long k = key(sender, seq);
 
             // Deduplicate — deliver only once per (sender, seq)
             if (delivered.add(k)) {
@@ -133,7 +134,7 @@ public final class PerfectLinkImpl implements PerfectLink {
 
         } else if (type == TYPE_ACK) {
             // ACK received — stop retransmitting
-            String k = key(sender, seq);
+            long k = key(sender, seq);
             awaitingAck.remove(k);
 
             byte[] msg = sentMessages.remove(k);
@@ -160,7 +161,7 @@ public final class PerfectLinkImpl implements PerfectLink {
     /**
      * Unique key for identifying a message by (processId, seqNr).
      */
-    private String key(int id, int seq) {
-        return id + ":" + seq;
+    private static long key(int sender, int seq) {
+        return (((long)sender) << 32) | (seq & 0xffffffffL);
     }
 }

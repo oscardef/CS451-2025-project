@@ -108,7 +108,7 @@ public final class FairLossLinkImpl implements FairLossLink {
 
     /** Receiver thread — no per-packet allocation */
     private void rxLoop() {
-        final byte[] buf = new byte[2048];
+        final byte[] buf = new byte[4096];
         final UdpChannel.SenderRef src = new UdpChannel.SenderRef();
 
         while (running.get()) {
