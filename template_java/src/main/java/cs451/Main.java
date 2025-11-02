@@ -34,7 +34,7 @@ public final class Main {
     private static final boolean MUTE_CONSOLE = true;
 
     /** Flush the log file every N deliveries/sends (count-based, not seq-based). */
-    private static final int LOG_FLUSH_INTERVAL = 50_000;
+    private static final int LOG_FLUSH_INTERVAL = 5_000;
 
     /** Empty payload (we only care about seq for this milestone). */
     private static final byte[] EMPTY_PAYLOAD = new byte[0];

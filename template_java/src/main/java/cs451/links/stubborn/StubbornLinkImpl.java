@@ -25,7 +25,7 @@ public class StubbornLinkImpl implements StubbornLink {
     private final Queue<SendEntry> pending = new ConcurrentLinkedQueue<>();
 
     /** Resend cadence (higher = fewer resends = less CPU, but slower recovery). */
-    private static final int RESEND_INTERVAL_MS = 100;
+    private static final int RESEND_INTERVAL_MS = 30;
 
     private static final class SendEntry {
         final Host dest;

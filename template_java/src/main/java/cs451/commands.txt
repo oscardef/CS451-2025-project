@@ -12,7 +12,7 @@ TESTING:
 
 sudo python ../tools/tc.py
 
-python ../tools/stress.py perfect -r ./run.sh -l ../example/output -p 10 -m 100000000
+python ../tools/stress.py perfect -r ./run.sh -l ../example/output -p 5 -m 10000
 
 
 python ../tools/verify_pl_outputs.py \
