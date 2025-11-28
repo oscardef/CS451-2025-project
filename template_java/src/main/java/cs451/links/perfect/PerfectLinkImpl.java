@@ -9,10 +9,17 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * PerfectLinkImpl — Reliable, Exactly-Once delivery with safe message batching.
+ * PerfectLinkImpl — Reliable, Exactly-Once delivery with optional message batching.
  *
- * Adds lightweight batching of DATA messages before sending to reduce per-packet overhead.
- * Batches are clearly marked with TYPE_BATCH to avoid decoding ambiguity.
+ * Implements Perfect Links semantics on top of Stubborn Links:
+ *   - Reliable delivery: messages are resent until ACKed.
+ *   - No duplication: delivered messages are deduplicated via a key set.
+ *   - No creation: only previously sent messages can be delivered.
+ *
+ * Improvements:
+ *   - ACKs are sent once (unreliable) to prevent resend flooding.
+ *   - Batching reduces per-packet overhead.
+ *   - Thread-safe structures for high concurrency.
  */
 public final class PerfectLinkImpl implements PerfectLink {
 
@@ -24,22 +31,22 @@ public final class PerfectLinkImpl implements PerfectLink {
     // ---- Control ----
     private final AtomicBoolean running = new AtomicBoolean(false);
 
-    // ---- Message bookkeeping ----
-    private final Set<Long> delivered = ConcurrentHashMap.newKeySet();       // Deduplication
-    private final Set<Long> awaitingAck = ConcurrentHashMap.newKeySet();     // Awaiting ACKs
-    private final Map<Long, byte[]> sentMessages = new ConcurrentHashMap<>();// Sent message cache
+    // ---- Bookkeeping ----
+    private final Set<Long> delivered = ConcurrentHashMap.newKeySet(); // deduplication
+    private final Map<Long, byte[]> sentMessages = new ConcurrentHashMap<>(); // seq -> message
+    private final Set<Long> awaitingAck = ConcurrentHashMap.newKeySet(); // awaiting ACKs
 
     // ---- Delivery callback ----
     private volatile DeliverHandler deliverHandler = (sender, seq, data) -> {};
 
-    // ---- Constants for message types ----
+    // ---- Message type codes ----
     private static final byte TYPE_DATA  = 1;
     private static final byte TYPE_ACK   = 2;
     private static final byte TYPE_BATCH = 3;
 
-    // ---- Batching ----
-    private static final int MAX_BATCH = 8;         // Messages per datagram
-    private static final int FLUSH_INTERVAL_MS = 2; // Flush interval
+    // ---- Batching configuration ----
+    private static final int MAX_BATCH = 8;
+    private static final int FLUSH_INTERVAL_MS = 2;
 
     private final Map<Integer, List<byte[]>> batchBuffers = new ConcurrentHashMap<>();
     private final ScheduledExecutorService batchFlusher =
@@ -61,7 +68,7 @@ public final class PerfectLinkImpl implements PerfectLink {
         slp.start();
         slp.onDeliver(this::handleReceive);
 
-        // Periodic flush of partial batches
+        // periodic flush of partial batches
         batchFlusher.scheduleAtFixedRate(this::flushAllBatches,
                 FLUSH_INTERVAL_MS, FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
@@ -131,16 +138,16 @@ public final class PerfectLinkImpl implements PerfectLink {
 
     /** Handles all messages received from the stubborn link layer. */
     private void handleReceive(int senderId, byte[] raw) {
-        if (raw == null || raw.length < 2) return; // safety check
+        if (raw == null || raw.length < 2) return;
         ByteBuffer bb = ByteBuffer.wrap(raw);
         byte type = bb.get();
 
         if (type == TYPE_BATCH) {
-            if (bb.remaining() < 4) return; // malformed
+            if (bb.remaining() < 4) return;
             int count = bb.getInt();
             for (int i = 0; i < count && bb.remaining() >= 4; i++) {
                 int len = bb.getInt();
-                if (len <= 0 || len > bb.remaining()) break; // avoid underflow
+                if (len <= 0 || len > bb.remaining()) break;
                 byte[] msg = new byte[len];
                 bb.get(msg);
                 handleSingleMessage(senderId, msg);
@@ -152,7 +159,7 @@ public final class PerfectLinkImpl implements PerfectLink {
 
     /** Handles one logical DATA or ACK message. */
     private void handleSingleMessage(int senderId, byte[] raw) {
-        if (raw == null || raw.length < 9) return; // too short for header
+        if (raw == null || raw.length < 9) return;
         ByteBuffer bb = ByteBuffer.wrap(raw);
         byte type = bb.get();
         int sender = bb.getInt();
@@ -167,10 +174,14 @@ public final class PerfectLinkImpl implements PerfectLink {
                 deliverHandler.deliver(sender, seq, payload);
             }
 
-            // Always send ACK
+            // Send ACK once (unreliable)
             Host senderHost = membership.get(sender - 1);
             byte[] ack = encodeMessage(TYPE_ACK, myId, seq, new byte[0]);
-            slp.send(senderHost, ack);
+            if (slp instanceof cs451.links.stubborn.StubbornLinkImpl) {
+                ((cs451.links.stubborn.StubbornLinkImpl) slp).sendOnce(senderHost, ack);
+            } else {
+                slp.send(senderHost, ack);
+            }
 
         } else if (type == TYPE_ACK) {
             long k = key(sender, seq);
@@ -183,7 +194,7 @@ public final class PerfectLinkImpl implements PerfectLink {
         }
     }
 
-    /** Encode one message: [type(1B) | sender(4B) | seq(4B) | payload...] */
+    /** Encodes one message: [type(1B) | sender(4B) | seq(4B) | payload...] */
     private byte[] encodeMessage(byte type, int senderId, int seq, byte[] data) {
         ByteBuffer bb = ByteBuffer.allocate(1 + 4 + 4 + data.length);
         bb.put(type);
@@ -193,8 +204,8 @@ public final class PerfectLinkImpl implements PerfectLink {
         return bb.array();
     }
 
-    /** Unique key for identifying a message by (processId, seqNr). */
+    /** Unique long key for message identity (sender, seq). */
     private static long key(int sender, int seq) {
-        return (((long)sender) << 32) | (seq & 0xffffffffL);
+        return (((long) sender) << 32) | (seq & 0xffffffffL);
     }
 }

@@ -4,34 +4,41 @@ import cs451.Host;
 import cs451.links.fairloss.FairLossLink;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * StubbornLinkImpl — keeps re-sending all messages periodically (classic SLP).
- * PL will call remove() once it gets an ACK.
+ * StubbornLinkImpl — ensures reliable message delivery by continuously
+ * retransmitting all pending DATA messages until acknowledged by the PerfectLink.
+ *
+ * Improvements:
+ *  - Messages remain in resendMap until PerfectLink confirms ACK.
+ *  - Resend interval lowered for faster recovery.
+ *  - ACKs can be sent unreliably via sendOnce() (not kept in resend loop).
+ *  - Thread-safe, minimal allocations, no silent drops.
  */
 public class StubbornLinkImpl implements StubbornLink {
 
     private final FairLossLink flp;
     private final List<Host> membership;
-
     private final AtomicBoolean running = new AtomicBoolean(false);
     private Thread resendThread;
 
+    /** Callback to deliver messages upward. */
     private volatile DeliverHandler deliverHandler = (src, data) -> {};
 
-    /** Messages to keep re-sending forever until removed. */
-    private final Queue<SendEntry> pending = new ConcurrentLinkedQueue<>();
+    /** Pending messages: key = (destId << 32) | seq-like hash, value = SendEntry */
+    private final Map<Long, SendEntry> resendMap = new ConcurrentHashMap<>();
 
-    /** Resend cadence (higher = fewer resends = less CPU, but slower recovery). */
-    private static final int RESEND_INTERVAL_MS = 30;
+    /** Retransmit every few ms for better reliability under loss. */
+    private static final int RESEND_INTERVAL_MS = 20;
 
     private static final class SendEntry {
         final Host dest;
         final byte[] data;
         SendEntry(Host dest, byte[] data) {
-            this.dest = dest; this.data = data;
+            this.dest = dest;
+            this.data = data;
         }
     }
 
@@ -56,13 +63,35 @@ public class StubbornLinkImpl implements StubbornLink {
     public void stop() {
         if (!running.compareAndSet(true, false)) return;
         flp.stop();
-        try { if (resendThread != null) resendThread.join(); } catch (InterruptedException ignored) {}
+        try {
+            if (resendThread != null) resendThread.join();
+        } catch (InterruptedException ignored) {}
     }
 
+    /**
+     * Send a message that must be retransmitted until ACKed.
+     */
     @Override
     public void send(Host dest, byte[] data) {
-        pending.add(new SendEntry(dest, data)); // remember for periodic resend
-        flp.send(dest, data);                   // send once now
+        // Compute stable key for deduping (hash avoids byte[] comparison)
+        long key = (((long) dest.getId()) << 32) ^ Arrays.hashCode(data);
+        resendMap.putIfAbsent(key, new SendEntry(dest, data));
+        flp.send(dest, data); // immediate first send
+    }
+
+    /**
+     * Send a message only once (for ACKs).
+     */
+    public void sendOnce(Host dest, byte[] data) {
+        flp.send(dest, data);
+    }
+
+    /**
+     * Remove message from resend map once an ACK is received.
+     */
+    public void remove(Host dest, byte[] data) {
+        long key = (((long) dest.getId()) << 32) ^ Arrays.hashCode(data);
+        resendMap.remove(key);
     }
 
     @Override
@@ -70,20 +99,20 @@ public class StubbornLinkImpl implements StubbornLink {
         this.deliverHandler = handler;
     }
 
-    /** Periodically re-send everything that hasn't been ACKed away. */
+    /**
+     * Periodically re-send all still-pending messages.
+     */
     private void resendLoop() {
         while (running.get()) {
             try {
-                for (SendEntry e : pending) {
+                for (SendEntry e : resendMap.values()) {
                     flp.send(e.dest, e.data);
                 }
                 Thread.sleep(RESEND_INTERVAL_MS);
-            } catch (InterruptedException ignored) {}
+            } catch (InterruptedException ignored) {
+            } catch (Exception ex) {
+                System.err.println("[StubbornLink] resend error: " + ex.getMessage());
+            }
         }
-    }
-
-    /** Called by PL when an ACK is received for (dest,msg). */
-    public void remove(Host dest, byte[] data) {
-        pending.removeIf(e -> e.dest.equals(dest) && Arrays.equals(e.data, data));
     }
 }
