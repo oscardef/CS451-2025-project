@@ -46,7 +46,7 @@ public final class PerfectLinkImpl implements PerfectLink {
 
     // ---- Batching configuration ----
     private static final int MAX_BATCH = 8;
-    private static final int FLUSH_INTERVAL_MS = 2;
+    private final int flushIntervalMs;
 
     private final Map<Integer, List<byte[]>> batchBuffers = new ConcurrentHashMap<>();
     private final ScheduledExecutorService batchFlusher =
@@ -57,9 +57,14 @@ public final class PerfectLinkImpl implements PerfectLink {
             });
 
     public PerfectLinkImpl(int myId, List<Host> membership, StubbornLink slp) {
+        this(myId, membership, slp, 2);
+    }
+
+    public PerfectLinkImpl(int myId, List<Host> membership, StubbornLink slp, int flushIntervalMs) {
         this.myId = myId;
         this.membership = membership;
         this.slp = slp;
+        this.flushIntervalMs = flushIntervalMs;
     }
 
     @Override
@@ -70,32 +75,62 @@ public final class PerfectLinkImpl implements PerfectLink {
 
         // periodic flush of partial batches
         batchFlusher.scheduleAtFixedRate(this::flushAllBatches,
-                FLUSH_INTERVAL_MS, FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS);
+                flushIntervalMs, flushIntervalMs, TimeUnit.MILLISECONDS);
     }
 
     @Override
     public void stop() {
         if (!running.compareAndSet(true, false)) return;
+        
+        // Count unflushed messages for debugging
+        int unflushed = 0;
+        for (List<byte[]> batch : batchBuffers.values()) {
+            synchronized (batch) {
+                unflushed += batch.size();
+            }
+        }
+        if (unflushed > 0) {
+            System.err.println("[PerfectLink] Flushing " + unflushed + " pending messages before shutdown");
+        }
+        
+        // CRITICAL: Flush all pending batches before stopping lower layers
+        flushAllBatches();
+        
         batchFlusher.shutdownNow();
+        try {
+            batchFlusher.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+        
         slp.stop();
     }
 
     @Override
     public void send(Host dest, byte[] data, int seq) {
         byte[] msg = encodeMessage(TYPE_DATA, myId, seq, data);
-        long k = key(dest.getId(), seq);
-
-        awaitingAck.add(k);
-        sentMessages.put(k, msg);
+        
+        // Use destination+hash key to match StubbornLink's key computation
+        long stubbornKey = (((long) dest.getId()) << 32) ^ Arrays.hashCode(msg);
+        awaitingAck.add(stubbornKey);
+        sentMessages.put(stubbornKey, msg);
 
         List<byte[]> batch = batchBuffers.computeIfAbsent(dest.getId(),
                 id -> Collections.synchronizedList(new ArrayList<>(MAX_BATCH)));
 
+        List<byte[]> toFlush = null;
         synchronized (batch) {
             batch.add(msg);
             if (batch.size() >= MAX_BATCH) {
-                flushBatch(dest, batch);
+                // Clone batch and clear inside lock, then flush outside
+                toFlush = new ArrayList<>(batch);
+                batch.clear();
             }
+        }
+        
+        // Flush outside synchronized block to prevent lock contention
+        if (toFlush != null) {
+            flushBatchDirect(dest, toFlush);
         }
     }
 
@@ -119,21 +154,28 @@ public final class PerfectLinkImpl implements PerfectLink {
     private void flushBatch(Host dest, List<byte[]> batch) {
         synchronized (batch) {
             if (batch.isEmpty()) return;
-
-            int total = 1 + 4; // type + count
-            for (byte[] m : batch) total += 4 + m.length;
-            ByteBuffer bb = ByteBuffer.allocate(total);
-
-            bb.put(TYPE_BATCH);
-            bb.putInt(batch.size());
-            for (byte[] m : batch) {
-                bb.putInt(m.length);
-                bb.put(m);
-            }
-
-            slp.send(dest, bb.array());
+            List<byte[]> toFlush = new ArrayList<>(batch);
             batch.clear();
+            flushBatchDirect(dest, toFlush);
         }
+    }
+    
+    /** Encodes and sends a batch without synchronization (caller must handle). */
+    private void flushBatchDirect(Host dest, List<byte[]> messages) {
+        if (messages.isEmpty()) return;
+
+        int total = 1 + 4; // type + count
+        for (byte[] m : messages) total += 4 + m.length;
+        ByteBuffer bb = ByteBuffer.allocate(total);
+
+        bb.put(TYPE_BATCH);
+        bb.putInt(messages.size());
+        for (byte[] m : messages) {
+            bb.putInt(m.length);
+            bb.put(m);
+        }
+
+        slp.send(dest, bb.array());
     }
 
     /** Handles all messages received from the stubborn link layer. */
@@ -184,12 +226,18 @@ public final class PerfectLinkImpl implements PerfectLink {
             }
 
         } else if (type == TYPE_ACK) {
-            long k = key(sender, seq);
-            awaitingAck.remove(k);
-            byte[] msg = sentMessages.remove(k);
-            if (msg != null) {
-                Host senderHost = membership.get(sender - 1);
-                slp.remove(senderHost, msg);
+            // Reconstruct the original message to compute matching key
+            byte[] originalMsg = encodeMessage(TYPE_DATA, sender, seq, payload);
+            
+            // Use destination+hash key (sender is the original sender, so use senderId as dest)
+            long stubbornKey = (((long) sender) << 32) ^ Arrays.hashCode(originalMsg);
+            
+            if (awaitingAck.remove(stubbornKey)) {
+                byte[] msg = sentMessages.remove(stubbornKey);
+                if (msg != null) {
+                    Host senderHost = membership.get(sender - 1);
+                    slp.remove(senderHost, msg);
+                }
             }
         }
     }

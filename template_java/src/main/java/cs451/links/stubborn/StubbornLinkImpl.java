@@ -62,10 +62,21 @@ public class StubbornLinkImpl implements StubbornLink {
     @Override
     public void stop() {
         if (!running.compareAndSet(true, false)) return;
+        
+        // Interrupt resend thread to avoid waiting for sleep to complete
+        if (resendThread != null) {
+            resendThread.interrupt();
+        }
+        
         flp.stop();
+        
         try {
-            if (resendThread != null) resendThread.join();
-        } catch (InterruptedException ignored) {}
+            if (resendThread != null) {
+                resendThread.join(100); // Wait up to 100ms
+            }
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**
